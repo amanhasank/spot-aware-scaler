@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-safety-controller
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-safety-controller
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-safety-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: node-safety-controller
+subjects:
+- kind: ServiceAccount
+  name: node-safety-controller
+  namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-safety-controller
+  namespace: kube-system
+  labels:
+    app: node-safety-controller
+spec:
+  selector:
+    matchLabels:
+      app: node-safety-controller
+  template:
+    metadata:
+      labels:
+        app: node-safety-controller
+    spec:
+      serviceAccountName: node-safety-controller
+      hostNetwork: true
+      containers:
+      - name: controller
+        image: alpine/k8s:1.28.0
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CHECK_INTERVAL
+          value: "5"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl
+          
+          log() {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [NODE-SAFETY] $1"
+          }
+          
+          check_spot_interruption() {
+            curl -s --max-time 2 --connect-timeout 1 \
+              http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null
+          }
+          
+          mark_node_unsafe() {
+            local node=$1
+            log "Marking node $node as unsafe for new pod scheduling"
+            
+            # Add label to identify terminating nodes
+            kubectl label node $node spot-terminating=true --overwrite
+            
+            # Add taint to prevent new pods (but allow existing ones)
+            kubectl taint node $node spot-terminating=true:NoSchedule --overwrite
+            
+            # Add annotation with timestamp
+            kubectl annotate node $node spot-termination-detected="$(date -Iseconds)" --overwrite
+            
+            log "Node $node marked as unsafe - new pods will avoid this node"
+          }
+          
+          cleanup_node_marks() {
+            local node=$1
+            log "Cleaning up safety marks from node $node"
+            
+            # Remove labels and taints
+            kubectl label node $node spot-terminating- 2>/dev/null || true
+            kubectl taint node $node spot-terminating- 2>/dev/null || true
+            kubectl annotate node $node spot-termination-detected- 2>/dev/null || true
+          }
+          
+          # Main monitoring loop
+          log "Starting Node Safety Controller on node $NODE_NAME"
+          log "Monitoring for spot interruptions every $CHECK_INTERVAL seconds"
+          
+          while true; do
+            if interruption_notice=$(check_spot_interruption); then
+              if echo "$interruption_notice" | grep -q "terminate\|stop"; then
+                log "SPOT INTERRUPTION DETECTED! Marking node as unsafe"
+                mark_node_unsafe $NODE_NAME
+                
+                # Continue monitoring but don't mark again
+                while true; do
+                  sleep 30
+                  log "Node $NODE_NAME still terminating, keeping safety marks"
+                done
+              fi
+            fi
+            
+            sleep $CHECK_INTERVAL
+          done
+        resources:
+          requests:
+            cpu: "20m"
+            memory: "32Mi"
+          limits:
+            cpu: "50m"
+            memory: "64Mi"
+      nodeSelector:
+        karpenter.sh/capacity-type: "spot"
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoExecute

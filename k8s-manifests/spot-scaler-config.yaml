@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spot-aware-scaler-config
+  namespace: spot-scaling
+data:
+  # Namespace targeting configuration
+  target-namespaces: "qa-eagles-1,qa-hot-1"  # Comma-separated list
+  namespace-mode: "whitelist"                 # whitelist, blacklist, or all
+  
+  # Scaling behavior configuration
+  protected-labels: "spot-aware=enabled"
+  scale-up-delay: "10"
+  scale-down-delay: "300"
+  check-interval: "30"
+  
+  # Advanced settings
+  debug-mode: "false"
+  dry-run: "false"
+---
+# Example configurations for different use cases:
+
+# Configuration 1: Only specific namespaces (RECOMMENDED)
+# target-namespaces: "qa-eagles-1,qa-hot-1,staging"
+# namespace-mode: "whitelist"
+
+# Configuration 2: All namespaces except specific ones
+# target-namespaces: "kube-system,kube-public,default"
+# namespace-mode: "blacklist"
+
+# Configuration 3: All namespaces
+# target-namespaces: ""
+# namespace-mode: "all"

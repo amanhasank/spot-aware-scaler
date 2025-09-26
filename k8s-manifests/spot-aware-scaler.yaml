@@ -1,0 +1,674 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spot-aware-scaler
+  namespace: spot-scaling
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spot-aware-scaler
+rules:
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "events"]
+  verbs: ["get", "list", "watch", "create", "patch", "update"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["scale-down-*"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spot-aware-scaler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spot-aware-scaler
+subjects:
+- kind: ServiceAccount
+  name: spot-aware-scaler
+  namespace: spot-scaling
+---
+# Additional Role for managing ConfigMaps in the spot-scaling namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: spot-scaling
+  name: spot-scaler-configmaps
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spot-scaler-configmaps
+  namespace: spot-scaling
+subjects:
+- kind: ServiceAccount
+  name: spot-aware-scaler
+  namespace: spot-scaling
+roleRef:
+  kind: Role
+  name: spot-scaler-configmaps
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spot-aware-scaler
+  namespace: spot-scaling
+  labels:
+    app: spot-aware-scaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spot-aware-scaler
+  template:
+    metadata:
+      labels:
+        app: spot-aware-scaler
+    spec:
+      serviceAccountName: spot-aware-scaler
+      containers:
+      - name: scaler
+        image: alpine/k8s:1.28.0
+        env:
+        - name: PROTECTED_LABELS
+          valueFrom:
+            configMapKeyRef:
+              name: spot-aware-scaler-config
+              key: protected-labels
+              optional: false
+        - name: TARGET_NAMESPACES
+          valueFrom:
+            configMapKeyRef:
+              name: spot-aware-scaler-config
+              key: target-namespaces
+              optional: false
+        - name: NAMESPACE_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: spot-aware-scaler-config
+              key: namespace-mode
+              optional: false
+        - name: SCALE_UP_DELAY
+          valueFrom:
+            configMapKeyRef:
+              name: spot-aware-scaler-config
+              key: scale-up-delay
+              optional: false
+        - name: SCALE_DOWN_DELAY
+          valueFrom:
+            configMapKeyRef:
+              name: spot-aware-scaler-config
+              key: scale-down-delay
+              optional: false
+        - name: CHECK_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+              name: spot-aware-scaler-config
+              key: check-interval
+              optional: false
+        - name: DEBUG
+          value: "false"
+        - name: QUIET_MODE
+          value: "true"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl jq
+          
+          # Logging levels: INFO, WARN, ERROR, DEBUG
+          log() {
+            local level=${2:-INFO}
+            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "[$timestamp] [$level] [SPOT-SCALER] $1"
+          }
+          
+          # Only log debug messages if DEBUG is enabled
+          debug() {
+            if [ "${DEBUG:-false}" = "true" ]; then
+              log "$1" "DEBUG"
+            fi
+          }
+          
+          # Warn level logging
+          warn() {
+            log "$1" "WARN"
+          }
+          
+          # Error level logging  
+          error() {
+            log "$1" "ERROR"
+          }
+          
+          # Parse target namespaces from environment variable
+          parse_target_namespaces() {
+            echo "$TARGET_NAMESPACES" | tr ',' '\n' | grep -v '^$'
+          }
+          
+          # Check if namespace is in scope for our monitoring
+          is_namespace_in_scope() {
+            local namespace=$1
+            local target_namespaces=$(parse_target_namespaces)
+            
+            if [ "$NAMESPACE_MODE" = "whitelist" ]; then
+              # Only process namespaces in the TARGET_NAMESPACES list
+              echo "$target_namespaces" | grep -q "^${namespace}$"
+              return $?
+            elif [ "$NAMESPACE_MODE" = "blacklist" ]; then
+              # Process all namespaces EXCEPT those in TARGET_NAMESPACES list
+              if echo "$target_namespaces" | grep -q "^${namespace}$"; then
+                return 1 # Namespace is blacklisted
+              else
+                return 0 # Namespace is allowed
+              fi
+            else
+              # Default: monitor all namespaces
+              return 0
+            fi
+          }
+          
+          # Get namespaces to monitor based on configuration
+          get_monitored_namespaces() {
+            if [ "$NAMESPACE_MODE" = "whitelist" ]; then
+              parse_target_namespaces
+            else
+              # For blacklist or default mode, get all namespaces and filter
+              kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | while read ns; do
+                if is_namespace_in_scope "$ns"; then
+                  echo "$ns"
+                fi
+              done
+            fi
+          }
+          
+          # Persistent scale-down tracking (restart-resilient)
+          schedule_scale_down() {
+            local deployment=$1
+            local namespace=$2
+            local scale_down_time=$(($(date +%s) + SCALE_DOWN_DELAY))
+            
+            log "📝 SCHEDULING: Scale-down for $deployment in $namespace at $(date -d @$scale_down_time)"
+            
+            # Create persistent scale-down schedule
+            kubectl create configmap "scale-down-${deployment}" \
+              --from-literal=deployment="$deployment" \
+              --from-literal=namespace="$namespace" \
+              --from-literal=scheduled_time="$scale_down_time" \
+              --from-literal=original_replicas="1" \
+              --from-literal=current_replicas="2" \
+              -n spot-scaling 2>/dev/null || \
+            kubectl patch configmap "scale-down-${deployment}" -n spot-scaling \
+              -p "{\"data\":{\"scheduled_time\":\"$scale_down_time\",\"current_replicas\":\"2\"}}"
+          }
+          
+          # Check and execute pending scale-downs
+          process_pending_scale_downs() {
+            local current_time=$(date +%s)
+            
+            # Find all scale-down schedules
+            for configmap in $(kubectl get configmaps -n spot-scaling -o name | grep "configmap/scale-down-" | sed 's/configmap\///'); do
+              local scheduled_time=$(kubectl get configmap "$configmap" -n spot-scaling -o jsonpath='{.data.scheduled_time}' 2>/dev/null || echo "0")
+              
+              if [ "$scheduled_time" -le "$current_time" ] && [ "$scheduled_time" -gt "0" ]; then
+                local deployment=$(kubectl get configmap "$configmap" -n spot-scaling -o jsonpath='{.data.deployment}' 2>/dev/null)
+                local namespace=$(kubectl get configmap "$configmap" -n spot-scaling -o jsonpath='{.data.namespace}' 2>/dev/null)
+                local original_replicas=$(kubectl get configmap "$configmap" -n spot-scaling -o jsonpath='{.data.original_replicas}' 2>/dev/null || echo "1")
+                
+                if [ -n "$deployment" ] && [ -n "$namespace" ]; then
+                  log "⏰ EXECUTING: Scheduled scale-down for $deployment in $namespace"
+                  
+                  # Get current replica count
+                  local current_replicas=$(kubectl get deployment "$deployment" -n "$namespace" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+                  
+                  if [ "$current_replicas" = "2" ]; then
+                    # Execute scale-down
+                    kubectl patch deployment "$deployment" -n "$namespace" -p "{\"spec\":{\"replicas\":$original_replicas}}" --type='merge'
+                    log "✅ SCALE-DOWN COMPLETE: $deployment back to $original_replicas replica (spot interruption handled successfully)"
+                  else
+                    log "⚠️  SCALE-DOWN SKIPPED: $deployment no longer at 2 replicas (current: $current_replicas)"
+                  fi
+                  
+                  # Clean up the schedule
+                  kubectl delete configmap "$configmap" -n spot-scaling 2>/dev/null || true
+                fi
+              fi
+            done
+          }
+          
+          # Track scaling operations to prevent race conditions
+          create_scaling_lock() {
+            local deployment=$1
+            local namespace=$2
+            kubectl create configmap "scaling-lock-${deployment}" \
+              --from-literal=timestamp="$(date +%s)" \
+              --from-literal=operation="scale-up" \
+              -n $namespace 2>/dev/null || true
+          }
+          
+          remove_scaling_lock() {
+            local deployment=$1
+            local namespace=$2
+            kubectl delete configmap "scaling-lock-${deployment}" -n $namespace 2>/dev/null || true
+          }
+          
+          check_scaling_lock() {
+            local deployment=$1
+            local namespace=$2
+            kubectl get configmap "scaling-lock-${deployment}" -n $namespace >/dev/null 2>&1
+          }
+          
+          get_deployment_info() {
+            local pod_name=$1
+            local namespace=$2
+            
+            # Find the deployment that owns this pod
+            local owner_name=$(kubectl get pod $pod_name -n $namespace -o jsonpath='{.metadata.ownerReferences[0].name}')
+            local owner_kind=$(kubectl get pod $pod_name -n $namespace -o jsonpath='{.metadata.ownerReferences[0].kind}')
+            
+            if [ "$owner_kind" = "ReplicaSet" ]; then
+              # Get deployment from replicaset
+              kubectl get replicaset $owner_name -n $namespace -o jsonpath='{.metadata.ownerReferences[0].name}'
+            else
+              echo $owner_name
+            fi
+          }
+          
+          scale_deployment() {
+            local deployment=$1
+            local namespace=$2
+            local replicas=$3
+            local reason=$4
+            
+            log "$reason: Scaling deployment $deployment in namespace $namespace to $replicas replicas"
+            
+            kubectl patch deployment $deployment -n $namespace \
+              -p '{"spec":{"replicas":'$replicas'}}' \
+              --type='merge'
+              
+            # Add annotation for tracking
+            kubectl annotate deployment $deployment -n $namespace \
+              "spot-scaler/last-action=$(date +%s)" \
+              "spot-scaler/reason=$reason" \
+              --overwrite
+          }
+          
+          wait_for_pod_ready() {
+            local deployment=$1
+            local namespace=$2
+            local target_replicas=$3
+            local timeout=180 # 3 minutes timeout
+            
+            log "Waiting for deployment $deployment to have $target_replicas ready replicas"
+            
+            local count=0
+            while [ $count -lt $timeout ]; do
+              local ready_replicas=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              
+              if [ "$ready_replicas" = "$target_replicas" ]; then
+                log "Deployment $deployment now has $ready_replicas ready replicas"
+                return 0
+              fi
+              
+              sleep 5
+              count=$((count + 5))
+            done
+            
+            log "Timeout waiting for deployment $deployment to scale to $target_replicas replicas"
+            return 1
+          }
+          
+          handle_spot_interruption() {
+            local terminating_node=$1
+            
+            log "🚨 SPOT INTERRUPTION: Handling node termination: $terminating_node"
+            debug "Checking namespaces in scope: $(get_monitored_namespaces | tr '\n' ',' | sed 's/,$//')"
+            
+            # Find all deployments with spot-aware label in monitored namespaces that have pods on terminating node
+            local processed_deployments=""
+            local found_deployments=0
+            
+            get_monitored_namespaces | while read namespace; do
+              if [ -n "$namespace" ]; then
+                debug "Scanning namespace $namespace for spot-aware deployments..."
+                
+                # Get all deployments with spot-aware=enabled label in this namespace
+                local deployments=$(kubectl get deployments -n "$namespace" -l $PROTECTED_LABELS -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+                
+                # PROACTIVE PROTECTION: Also check for single-replica deployments that might be affected
+                # even if we can't detect their pods on the terminating node due to race conditions
+                debug "Checking for single-replica deployments that need proactive protection..."
+                local single_replica_deployments=$(kubectl get deployments -n "$namespace" -l $PROTECTED_LABELS -o jsonpath='{range .items[?(@.spec.replicas==1)]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+                
+                # First process single-replica deployments proactively (race condition protection)
+                if [ -n "$single_replica_deployments" ]; then
+                  log "🛡️  PROACTIVE PROTECTION: Found single-replica deployments that need scaling during spot interruption"
+                  echo "$single_replica_deployments" | while read deployment; do
+                    if [ -n "$deployment" ]; then
+                      log "🚀 PROACTIVE SCALING: $deployment (single replica detected during spot interruption)"
+                      
+                      # Check if we've already processed this deployment
+                      if echo "$processed_deployments" | grep -q "$namespace/$deployment"; then
+                        debug "Deployment $deployment already processed, skipping proactive scaling"
+                        continue
+                      fi
+                      
+                      # Scale immediately to prevent downtime
+                      kubectl patch deployment $deployment -n $namespace -p '{"spec":{"replicas":2}}' --type='merge'
+                      log "✅ PROACTIVE SCALING COMPLETE: $deployment scaled to 2 replicas"
+                      
+                      # Schedule persistent scale-down (restart-resilient)
+                      schedule_scale_down "$deployment" "$namespace"
+                      
+                      processed_deployments="$processed_deployments$namespace/$deployment\n"
+                      found_deployments=$((found_deployments + 1))
+                    fi
+                  done
+                fi
+                
+                # Then process deployments with detected pods on terminating node (original logic)
+                if [ -n "$deployments" ]; then
+                  echo "$deployments" | while read deployment; do
+                    if [ -n "$deployment" ]; then
+                        # Get deployment selector labels to find its pods (support multiple label patterns)
+                        local selector_labels=""
+                        local app_label=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.spec.selector.matchLabels.app}' 2>/dev/null)
+                        local component_label=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.spec.selector.matchLabels.component}' 2>/dev/null)
+                        local name_label=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.spec.selector.matchLabels.name}' 2>/dev/null)
+                        
+                        # Build selector based on available labels
+                        if [ -n "$app_label" ]; then
+                          selector_labels="app=$app_label"
+                        elif [ -n "$component_label" ]; then
+                          selector_labels="component=$component_label"
+                        elif [ -n "$name_label" ]; then
+                          selector_labels="name=$name_label"
+                        else
+                          # Fallback: get all selector labels dynamically
+                          selector_labels=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null | jq -r '. | to_entries | map("\(.key)=\(.value)") | join(",")')
+                        fi
+                        
+                        debug "Using selector labels for $deployment: $selector_labels"
+                        
+                        # Check if this deployment has any pods on the terminating node OR pods being terminated
+                        local pods_on_node=""
+                        if [ -n "$selector_labels" ]; then
+                          # Check for pods actually on the terminating node
+                          pods_on_node=$(kubectl get pods -n "$namespace" -l "$selector_labels" --field-selector spec.nodeName=$terminating_node -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+                          
+                          # Also check for pods that are being terminated due to this node interruption
+                          if [ -z "$pods_on_node" ]; then
+                            local terminating_pods=$(kubectl get pods -n "$namespace" -l "$selector_labels" --field-selector status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}:{.status.containerStatuses[0].state}{"\n"}{end}' 2>/dev/null | grep -i "terminating\|killing" | cut -d: -f1)
+                            if [ -n "$terminating_pods" ]; then
+                              pods_on_node="$terminating_pods (terminating due to node interruption)"
+                              debug "Found terminating pods that may be affected by node $terminating_node: $terminating_pods"
+                            fi
+                          fi
+                        fi
+                        
+                        if [ -n "$pods_on_node" ]; then
+                          log "📦 Found affected deployment: $deployment (pods: $pods_on_node)"
+                          found_deployments=$((found_deployments + 1))
+                          
+                          # Check if we've already processed this deployment (avoid duplicates)
+                          if echo "$processed_deployments" | grep -q "$namespace/$deployment"; then
+                            debug "Deployment $deployment in namespace $namespace already processed, skipping"
+                            continue
+                          fi
+                          processed_deployments="$processed_deployments$namespace/$deployment\n"
+                          
+                          # Check if we're already scaling this deployment
+                          if check_scaling_lock $deployment $namespace; then
+                            warn "Deployment $deployment is already being scaled, skipping"
+                            continue
+                          fi
+                          
+                          # Create scaling lock
+                          create_scaling_lock $deployment $namespace
+                          
+                          # Get current replica count
+                          local current_replicas=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.spec.replicas}')
+                          
+                          if [ "$current_replicas" = "1" ]; then
+                    log "⚡ SCALING UP: $deployment (1→2 replicas) to avoid downtime"
+                    
+                    # Step 1: Scale up without any deployment config changes
+                    # This leverages the EXISTING deployment configuration as-is
+                    kubectl patch deployment $deployment -n $namespace \
+                      -p '{"spec":{"replicas":2}}' \
+                      --type='merge'
+                    
+                    debug "Scaled up to 2 replicas. NTH cordoned terminating node, new pod will be placed safely."
+                    
+                    # NTH has already done the heavy lifting:
+                    # - Terminating node is cordoned (SchedulingDisabled)
+                    # - Kubernetes scheduler will automatically avoid it
+                    # - New pod will be placed on an available spot node that's NOT terminating
+                    
+                    # Optional: Add additional safety checks
+                    sleep 5
+                    debug "Verifying new pod placement..."
+                    
+                    # Find the new pod (most recent one)
+                    local new_pod=$(kubectl get pods -n $namespace -l app=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.spec.selector.matchLabels.app}') \
+                      --sort-by='.metadata.creationTimestamp' -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+                    
+                    if [ -n "$new_pod" ]; then
+                      local new_pod_node=$(kubectl get pod $new_pod -n $namespace -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                      if [ "$new_pod_node" != "$terminating_node" ]; then
+                        log "✅ SUCCESS: New pod $new_pod placed on safe node: $new_pod_node"
+                      else
+                        warn "⚠️  New pod placed on terminating node - this shouldn't happen with NTH"
+                      fi
+                    fi
+                    
+                    # Wait for new replica to be ready
+                    if wait_for_pod_ready $deployment $namespace 2; then
+                      log "✅ READY: Deployment $deployment has 2 healthy replicas (zero downtime achieved)"
+                      
+                      # Schedule intelligent scale-down after delay
+                      (
+                        sleep $SCALE_DOWN_DELAY
+                        log "⏰ SCALE-DOWN: Starting intelligent scale-down of $deployment (after ${SCALE_DOWN_DELAY}s delay)"
+                        
+                        # Get all pods of this deployment
+                        local all_pods=$(kubectl get pods -n $namespace -l app=$(kubectl get deployment $deployment -n $namespace -o jsonpath='{.spec.selector.matchLabels.app}') -o jsonpath='{range .items[*]}{.metadata.name}:{.spec.nodeName}:{.status.phase}{"\n"}{end}')
+                        
+                        local safe_spot_pod=""
+                        local terminating_spot_pod=""
+                        
+                        # Identify which pods are on safe vs terminating spot nodes
+                        echo "$all_pods" | while IFS=':' read pod_name node_name pod_status; do
+                          if [ "$pod_status" = "Running" ] && [ -n "$node_name" ]; then
+                            # Check if node is spot and if it's schedulable
+                            local is_spot=$(kubectl get node $node_name -o jsonpath='{.metadata.labels.eks\.amazonaws\.com/capacityType}' 2>/dev/null)
+                            local is_schedulable=$(kubectl get node $node_name -o jsonpath='{.spec.unschedulable}' 2>/dev/null)
+                            
+                            if [ "$is_spot" = "SPOT" ]; then
+                              if [ "$is_schedulable" = "true" ]; then
+                                terminating_spot_pod=$pod_name  # Node is cordoned/unschedulable
+                                debug "Found pod $pod_name on terminating spot node $node_name (unschedulable)"
+                              else
+                                safe_spot_pod=$pod_name  # Node is still schedulable
+                                debug "Found pod $safe_spot_pod on safe spot node $node_name (schedulable)"
+                              fi
+                            fi
+                          fi
+                        done
+                        
+                        # Intelligent pod selection: prefer safe spot pod
+                        if [ -n "$safe_spot_pod" ] && [ -n "$terminating_spot_pod" ]; then
+                          log "🎯 INTELLIGENT CLEANUP: Keeping safe pod $safe_spot_pod, removing terminating pod $terminating_spot_pod"
+                          kubectl delete pod $terminating_spot_pod -n $namespace --grace-period=30
+                        elif [ -n "$safe_spot_pod" ]; then
+                          debug "Only safe spot pod found ($safe_spot_pod), scaling down normally"
+                        elif [ -n "$terminating_spot_pod" ]; then
+                          debug "Only terminating spot pod found ($terminating_spot_pod), but it should have been replaced by now"
+                        else
+                          debug "No clear pod preference found, letting Kubernetes decide on scale-down"
+                        fi
+                        
+                        # Scale down to 1 replica (keep original deployment unchanged)
+                        kubectl patch deployment $deployment -n $namespace \
+                          -p '{"spec":{"replicas":1}}' \
+                          --type='merge'
+                        
+                        log "✅ SCALE-DOWN COMPLETE: $deployment back to 1 replica (spot interruption handled successfully)"
+                        
+                        # Remove scaling lock
+                        remove_scaling_lock $deployment $namespace
+                      ) &
+                      
+                    else
+                            error "Failed to scale up deployment $deployment properly"
+                            remove_scaling_lock $deployment $namespace
+                          fi
+                        else
+                          debug "Deployment $deployment already has $current_replicas replicas, no scaling needed"
+                          remove_scaling_lock $deployment $namespace
+                        fi
+                      else
+                        debug "No pods found for deployment $deployment on terminating node $terminating_node"
+                      fi
+                    fi
+                  done
+                else
+                  debug "No spot-aware deployments found in namespace $namespace"
+                fi
+              fi
+            done
+            
+            if [ $found_deployments -eq 0 ]; then
+              debug "No affected deployments found on terminating node $terminating_node"
+            else
+              log "✅ PROCESSED: Handled $found_deployments deployment(s) affected by node $terminating_node termination"
+            fi
+          }
+          
+          # Watch for multiple types of spot interruption events
+          log "🚀 STARTING: Spot-Aware Scaler v2.1 (Fixed Logic)"
+          log "📋 CONFIG: Mode=$NAMESPACE_MODE, Namespaces=$TARGET_NAMESPACES"
+          log "🎯 MONITORING: $(get_monitored_namespaces | tr '\n' ',' | sed 's/,$//')"
+          log "👁️  Watching for spot interruption events (cordon + specific taints)..."
+          
+          # Resume any interrupted scale-down operations on startup
+          log "🔄 STARTUP: Checking for interrupted scale-down operations..."
+          process_pending_scale_downs
+          
+          # Monitor 1: Cordoned spot nodes (primary detection with NTH CORDON_ONLY=true)
+          while true; do
+            # Process pending scale-downs every iteration
+            process_pending_scale_downs
+            # Check all spot nodes that are cordoned (SchedulingDisabled)
+            kubectl get nodes -l karpenter.sh/capacity-type=spot --field-selector spec.unschedulable=true --no-headers 2>/dev/null | while read node_name status role age version; do
+              if [ -n "$node_name" ]; then
+                # Check if we haven't already processed this cordoned node
+                if ! kubectl get configmap "cordon-processed-$node_name" -n spot-scaling >/dev/null 2>&1; then
+                  log "🚫 CORDON DETECTED: Spot node $node_name is cordoned (SchedulingDisabled)"
+                  # Create a marker to avoid reprocessing
+                  kubectl create configmap "cordon-processed-$node_name" -n spot-scaling --from-literal=timestamp="$(date +%s)" 2>/dev/null || true
+                  handle_spot_interruption $node_name
+                fi
+              fi
+            done
+            
+            # Also check karpenter nodes for cordoning
+            kubectl get nodes -l karpenter.sh/capacity-type=spot --no-headers 2>/dev/null | while read node_name status role age version; do
+              if [ -n "$node_name" ] && [[ "$status" == *"SchedulingDisabled"* ]]; then
+                # Check if we haven't already processed this cordoned node
+                if ! kubectl get configmap "cordon-processed-$node_name" -n spot-scaling >/dev/null 2>&1; then
+                  log "� CORDON DETECTED: Spot node $node_name is cordoned (SchedulingDisabled)"
+                  # Create a marker to avoid reprocessing
+                  kubectl create configmap "cordon-processed-$node_name" -n spot-scaling --from-literal=timestamp="$(date +%s)" 2>/dev/null || true
+                  handle_spot_interruption $node_name
+                fi
+              fi
+            done
+            
+            # Also check nodes with eks labels as fallback
+            kubectl get nodes -l eks.amazonaws.com/capacityType=spot --no-headers 2>/dev/null | while read node_name status role age version; do
+              if [ -n "$node_name" ]; then
+                spot_taint_info=$(kubectl get node "$node_name" -o jsonpath='{.spec.taints[?(@.effect=="NoSchedule" && (@.key=="node.kubernetes.io/unreachable" || @.key=="aws-node-termination-handler/spot-itn" || @.key=="ToBeDeletedByClusterAutoscaler"))].key}' 2>/dev/null)
+                if [ -n "$spot_taint_info" ]; then
+                  if ! kubectl get configmap "taint-processed-$node_name" -n spot-scaling >/dev/null 2>&1; then
+                    log "🔥 SPOT TAINT DETECTED: NoSchedule on spot node $node_name (source: $spot_taint_info)"
+                    kubectl create configmap "taint-processed-$node_name" -n spot-scaling --from-literal=timestamp="$(date +%s)" 2>/dev/null || true
+                    handle_spot_interruption $node_name
+                  fi
+                fi
+              fi
+            done
+            
+            sleep 5  # Check every 5 seconds for faster detection
+          done &
+          
+          # Monitor 2: Pod eviction events (TaintManagerEviction) - backup detection
+          kubectl get events --all-namespaces --field-selector reason=TaintManagerEviction -w --output-watch-events | \
+          while read event; do
+            pod_name=$(echo "$event" | jq -r '.object.metadata.name // empty' 2>/dev/null)
+            pod_namespace=$(echo "$event" | jq -r '.object.metadata.namespace // empty' 2>/dev/null)
+            
+            if [ -n "$pod_name" ] && [ -n "$pod_namespace" ]; then
+              # Only trigger if we haven't already detected via taint monitoring
+              node_name=$(kubectl get pod $pod_name -n $pod_namespace -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+              if [ -n "$node_name" ] && ! kubectl get configmap "taint-processed-$node_name" -n spot-scaling >/dev/null 2>&1; then
+                if kubectl get node $node_name -o jsonpath='{.metadata.labels}' 2>/dev/null | grep -q "karpenter.sh/capacity-type.*spot\|eks.amazonaws.com/capacityType.*spot"; then
+                  log "📤 EVICTION DETECTED: Pod $pod_namespace/$pod_name evicted from spot node $node_name (backup method)"
+                  kubectl create configmap "taint-processed-$node_name" -n spot-scaling --from-literal=timestamp="$(date +%s)" 2>/dev/null || true
+                  handle_spot_interruption $node_name
+                fi
+              fi
+            fi
+          done &
+          
+          # Monitor 3: Direct node status monitoring (backup method)
+          while true; do
+            # Process pending scale-downs in backup monitor too
+            process_pending_scale_downs
+            # Check for nodes that became unschedulable recently
+            kubectl get nodes --field-selector spec.unschedulable=true --no-headers 2>/dev/null | while read node_name status _; do
+              if [ -n "$node_name" ]; then
+                # Get node labels to check if it's a spot node
+                node_labels=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels}' 2>/dev/null || echo "")
+                if [[ "$node_labels" == *"karpenter.sh/capacity-type"*"spot"* ]] || [[ "$node_labels" == *"eks.amazonaws.com/capacityType"*"spot"* ]]; then
+                  # Check if we haven't already processed this node recently
+                  if ! kubectl get configmap "node-processed-$node_name" -n spot-scaling >/dev/null 2>&1; then
+                    log "🚫 CORDON DETECTED: Spot node $node_name cordoned (backup method)"
+                    # Create a marker to avoid reprocessing
+                    kubectl create configmap "node-processed-$node_name" -n spot-scaling --from-literal=timestamp="$(date +%s)" 2>/dev/null || true
+                    handle_spot_interruption $node_name
+                  fi
+                fi
+              fi
+            done
+            
+            # Cleanup old processed node markers (older than 1 hour)
+            kubectl get configmaps -n spot-scaling --no-headers 2>/dev/null | grep -E "^(node-processed-|taint-processed-|cordon-processed-)" | while read configmap_name _; do
+              timestamp=$(kubectl get configmap "$configmap_name" -n spot-scaling -o jsonpath='{.data.timestamp}' 2>/dev/null || echo "0")
+              if [ -n "$timestamp" ] && [ $(($(date +%s) - timestamp)) -gt 3600 ]; then
+                kubectl delete configmap "$configmap_name" -n spot-scaling 2>/dev/null || true
+              fi
+            done
+            
+            sleep $CHECK_INTERVAL
+          done
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
